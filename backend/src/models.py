@@ -7,6 +7,8 @@ class User(Base):
     email:Mapped[str]=mapped_column(String(120),unique=True)
     password:Mapped[str]=mapped_column(String(256))
     role:Mapped[str]=mapped_column(String(20))
+    # 主管跨经销商，dealer_id 为空；评估员/观察员绑定单一经销商
+    dealer_id:Mapped[int|None]=mapped_column(ForeignKey('dealers.id'),nullable=True)
 class Machine(Base):
     __tablename__='machines'
     __table_args__=(CheckConstraint('hours >= 0 AND warranty_hours > 0'),)
@@ -16,6 +18,8 @@ class Machine(Base):
     purchase_date:Mapped[str]=mapped_column(String(10))
     warranty_hours:Mapped[int]=mapped_column(default=2000)
     hours:Mapped[int]=mapped_column(default=0)
+    # 当前归属经销商；为空表示旧数据尚未被主管认领，仅主管可见
+    dealer_id:Mapped[int|None]=mapped_column(ForeignKey('dealers.id'),nullable=True)
 class Claim(Base):
     __tablename__='claims'
     __table_args__=(CheckConstraint('hours_at_failure >= 0 AND age_days >= 0'),)
@@ -31,6 +35,8 @@ class Claim(Base):
     historical:Mapped[bool]=mapped_column(Boolean,default=False)
     disputed:Mapped[int|None]=mapped_column(Integer,nullable=True)
     assessment_note:Mapped[str]=mapped_column(Text,default='')
+    # 受理时点快照归属：交接前受理的索赔永远归原商，新索赔归接收商
+    dealer_id:Mapped[int|None]=mapped_column(ForeignKey('dealers.id'),nullable=True)
 class Inspection(Base):
     __tablename__='inspections'
     id:Mapped[int]=mapped_column(primary_key=True)
@@ -45,3 +51,5 @@ class Audit(Base):
     action:Mapped[str]=mapped_column(String(100))
     detail:Mapped[str]=mapped_column(Text)
     at:Mapped[str]=mapped_column(String(40))
+    # 归属过滤：主管可看全量；经销商账号只读本商动作，全局动作（空）不向其开放
+    dealer_id:Mapped[int|None]=mapped_column(ForeignKey('dealers.id'),nullable=True)

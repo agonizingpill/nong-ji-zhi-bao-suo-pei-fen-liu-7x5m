@@ -20,9 +20,20 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 |角色|账号|口令|主要权限|
 |---|---|---|---|
-|admin 质保主管|admin@gengchuan.local|Field2026!|台账编辑、受理、拆检、最终赔付/拒赔、旧件核验、结算核定和记账|
-|assessor 拆检评估员|assessor@gengchuan.local|Field2026!|新机登记、索赔、分流、拆检、旧件发件/收货、结算草稿；不可签署|
-|viewer 经销商观察员|viewer@gengchuan.local|Field2026!|只读九页及审计|
+|admin 质保主管|admin@gengchuan.local|Field2026!|跨经销商台账编辑、受理、拆检、最终赔付/拒赔、机具交接、旧数据一次认领、旧件核验、结算核定和记账|
+|assessor 北塬评估员|assessor@gengchuan.local|Field2026!|仅本商：新机登记、索赔、分流、拆检、旧件发件/收货、结算草稿；不可签署|
+|assessor 南滩评估员|assessor.south@gengchuan.local|Field2026!|同上，数据范围限南滩经销商|
+|viewer 北塬观察员|viewer@gengchuan.local|Field2026!|仅本商只读九页及审计|
+|viewer 南滩观察员|viewer.south@gengchuan.local|Field2026!|同上，数据范围限南滩经销商|
+
+## 经销商隔离与机具交接
+
+- **归属模型**：`dealers` 为经销商目录；`users/machines/claims/audit` 均带 `dealer_id`。主管 `dealer_id` 为空即跨商；评估员与观察员绑定单一经销商。
+- **列表与详情隔离**：所有列表查询经 `tenancy.scope_stmt` 按归属过滤；详情和写操作经 `locked_claim/get_claim/visible_machine` 校验，越权统一返回 **404**，不暴露他商记录是否存在。返厂、结算、维修、备件、回访整条证据链随索赔归属隔离。
+- **交接快照规则**：机具当前归属存在 `machines.dealer_id`；索赔在**受理时点**把归属快照写入 `claims.dealer_id`。主管 `POST /machines/{id}/handover` 交接机具后，交接前已受理的索赔仍归原商，新索赔归接收商，双方互看不到对方索赔。交接目标与当前归属相同时幂等返回，不重复写交接记录；交接历史见 `GET /machines/{id}/handovers`。
+- **并发与回滚**：交接与索赔受理都在事务内对机具行 `SELECT ... FOR UPDATE`，以先落定的归属受理；任一步失败整体回滚，重试不会产生重复交接。
+- **风险分流隐私**：模型仍可用全站历史训练（`risk_model.py` 标记 `training_scope=all_dealers_historical`），但只回传训练/留出条数、AUC、系数等聚合指标，评估页和 worker 落盘都不含任何经销商的原始样本。
+- **旧数据认领**：历史 seed 数据 `dealer_id` 为空，仅主管可见。主管在机具台账页或 `POST /legacy/claim` 一次认领全部未归属机具与索赔（可指定目标商，留空则轮询分派），认领幂等；未认领记录对经销商账号始终不可见、不可受理。
 
 ## 业务与页面
 
@@ -34,7 +45,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 5. 旧件返厂：索赔完成分流并有拆检意见后登记物流；每份索赔仅一单，实收序列必须匹配发件快照；收货证据不得覆盖，主管核验后冻结。
 6. 赔付结算：仅已赔付且旧件核验通过的现场索赔可生成费用核定单；Python Decimal 按配件费＋工时×费率计算金额上限；主管核定不得超额，核定后冻结金额，使用唯一记账凭证一次入账。
 
-历史数据为固定 seed=42 生成的 180 条**模拟**已结案索赔，只用于演示。ColumnTransformer 对机型和故障部位 One-hot 编码，对故障工时、机龄、渗漏数值标准化，LogisticRegression 分类；分层留出 25%（45条），训练集 135 条，报告留出 accuracy/ROC AUC 及编码后系数。输入来自领域表而非任意 JSON。数据不足40条拒绝训练；不把模型输出作为自动赔付依据。随机种子42、训练/留出划分固定，模型的概率是模拟数据上的演示估计，未作真实业务校准。
+历史数据为固定 seed=42 生成的 180 条**模拟**已结案索赔，只用于演示，初始 `dealer_id` 为空（未认领，仅主管可见）。ColumnTransformer 对机型和故障部位 One-hot 编码，对故障工时、机龄、渗漏数值标准化，LogisticRegression 分类；分层留出 25%（45条），训练集 135 条，报告留出 accuracy/ROC AUC 及编码后系数。输入来自领域表而非任意 JSON。数据不足40条拒绝训练；不把模型输出作为自动赔付依据。随机种子42、训练/留出划分固定，模型的概率是模拟数据上的演示估计，未作真实业务校准。训练可跨商使用全站历史，但接口只返回聚合指标与系数，不返回他商原始样本。
 
 ### 一天的工作剧本
 
@@ -51,7 +62,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 |队列|Redis7 list；共享 artifacts 卷保存模型指标与心跳|
 |安全横切|JWT8小时、角色校验、PBKDF2口令、审计、请求追踪、全局错误恢复|
 
-`backend/src/models.py` 领域实体；`schemas.py` 请求约束；`claim_service.py` 状态与关联规则；`risk_model.py` 算法；`worker.py` 队列；`main.py` 路由；`middlewares.py` 请求追踪和错误恢复。`backend/scripts/seed_demo.py` 仅插入自然键缺失的演示记录，不覆盖修改。`frontend/src/pages/` 九业务页；`components/common.js` 共享导航、状态、标题和通知；`utils/api.js` API/会话/页面状态；`utils/format.js` 转义和格式化。
+`backend/src/models.py` 领域实体（含经销商归属列）；`dealer_models.py` 经销商目录与机具交接记录；`tenancy.py` 经销商隔离、行锁交接与旧数据认领；`schema_bootstrap.py` 既有库幂等补列；`schemas.py` 请求约束；`claim_service.py` 状态与关联规则；`risk_model.py` 算法；`worker.py` 队列；`main.py` 路由；`middlewares.py` 请求追踪和错误恢复。`backend/scripts/seed_demo.py` 仅插入自然键缺失的演示记录，不覆盖修改。`frontend/src/pages/` 九业务页；`components/common.js` 共享导航、状态、标题、归属徽标和通知；`utils/api.js` API/会话/页面状态；`utils/format.js` 转义和格式化。
 
 角色、索赔状态、故障部位枚举分别在 `backend/src/constants.py` 与 `frontend/src/constants.js` 定义；请求部位在 `backend/src/schemas.py` 的 Literal 中约束；角色校验在 `security.py`/`main.py`，状态转换在 `claim_service.py`/`worker.py`。共用状态徽标在索赔/风险/拆检三页复用。
 

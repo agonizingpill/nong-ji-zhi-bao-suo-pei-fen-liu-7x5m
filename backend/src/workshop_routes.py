@@ -2,15 +2,22 @@ from fastapi import APIRouter,Depends,HTTPException
 from sqlalchemy import select
 from .database import Session
 from .security import current,allow
+from .models import Claim
 from .repair_models import RepairBay,RepairAppointment
 from .spare_models import SpareStock,PartIssue
 from .followup_models import RepairFollowup
 from .workshop_schemas import BayIn,AppointmentIn,FinishIn,StockIn,IssueIn,FollowupIn,ReworkIn
 from .claim_service import obj,audit
 from . import repair_service as repair,spare_service as spare,followup_service as followup
+from . import tenancy
 router=APIRouter()
+def _claim_ids(s,u):
+    stmt=select(Claim.id)
+    if not tenancy.is_admin(u):stmt=stmt.where(Claim.dealer_id==u['dealer_id'])
+    return {row for row in s.scalars(stmt)}
 @router.get('/repair-bays')
 def bays(u=Depends(current)):
+    # 工位与备件库为共享资源，三角色均可见目录
     with Session() as s:return [obj(x) for x in s.scalars(select(RepairBay).order_by(RepairBay.id))]
 @router.post('/repair-bays')
 def bay(d:BayIn,u=Depends(current)):
@@ -29,7 +36,9 @@ def edit_bay(id:int,d:BayIn,u=Depends(current)):
         x.daily_hours=d.daily_hours;x.active=d.active;audit(s,u,'repair_bay_updated',x.code);return obj(x)
 @router.get('/repair-appointments')
 def appointments(u=Depends(current)):
-    with Session() as s:return [repair.view(s,x) for x in s.scalars(select(RepairAppointment).order_by(RepairAppointment.id.desc()))]
+    with Session() as s:
+        ids=_claim_ids(s,u)
+        return [repair.view(s,x) for x in s.scalars(select(RepairAppointment).order_by(RepairAppointment.id.desc())) if x.claim_id in ids]
 @router.post('/repair-appointments')
 def reserve(d:AppointmentIn,u=Depends(current)):
     allow(u,'admin','assessor')
@@ -52,7 +61,13 @@ def stock(d:StockIn,u=Depends(current)):
         x=SpareStock(**d.model_dump());s.add(x);s.flush();audit(s,u,'stock_registered',x.code);return obj(x)
 @router.get('/part-issues')
 def issues(u=Depends(current)):
-    with Session() as s:return [spare.view(s,x) for x in s.scalars(select(PartIssue).order_by(PartIssue.id.desc()))]
+    with Session() as s:
+        ids=_claim_ids(s,u)
+        out=[]
+        for x in s.scalars(select(PartIssue).order_by(PartIssue.id.desc())):
+            appt=s.get(RepairAppointment,x.appointment_id)
+            if appt and appt.claim_id in ids:out.append(spare.view(s,x))
+        return out
 @router.post('/part-issues')
 def issue(d:IssueIn,u=Depends(current)):
     allow(u,'admin','assessor')
@@ -63,7 +78,13 @@ def give_back(id:int,u=Depends(current)):
     with Session.begin() as s:return spare.give_back(s,id,u)
 @router.get('/repair-followups')
 def followups(u=Depends(current)):
-    with Session() as s:return [followup.view(s,x) for x in s.scalars(select(RepairFollowup).order_by(RepairFollowup.id.desc()))]
+    with Session() as s:
+        ids=_claim_ids(s,u)
+        out=[]
+        for x in s.scalars(select(RepairFollowup).order_by(RepairFollowup.id.desc())):
+            appt=s.get(RepairAppointment,x.appointment_id)
+            if appt and appt.claim_id in ids:out.append(followup.view(s,x))
+        return out
 @router.post('/repair-followups')
 def add_followup(d:FollowupIn,u=Depends(current)):
     allow(u,'admin','assessor')

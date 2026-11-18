@@ -17,7 +17,8 @@ while True:
             m=s.get(Machine,c.machine_id)
             if c.hours_at_failure>m.warranty_hours:c.status='out_of_warranty';c.assessment_note='超出质保工时';continue
             c.risk,metrics=assess(s,c);c.status='assessed';c.assessment_note=json.dumps(metrics,ensure_ascii=False)
-            Path(f'/artifacts/claim-{cid}-model.json').write_text(json.dumps(metrics))
+            # 仅落盘汇总指标（行数/AUC/系数），不写入任何他商原始样本
+            Path(f'/artifacts/claim-{cid}-model.json').write_text(json.dumps(metrics,ensure_ascii=False))
     except Exception as e:
         with Session.begin() as s:
             c=s.get(Claim,cid)

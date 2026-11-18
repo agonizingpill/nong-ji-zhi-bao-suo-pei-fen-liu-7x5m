@@ -1,21 +1,38 @@
 import random, json
 from sqlalchemy import select,func
 from src.database import Base,engine,Session
-from src.models import User,Machine,Claim,Inspection
+from src.models import User,Machine,Claim,Inspection,Audit
 from src.security import password_hash
+from src.dealer_models import Dealer
 from src.return_models import PartReturn
 from src.settlement_models import Settlement
 from src.repair_models import RepairBay,RepairAppointment
 from src.spare_models import SpareStock,PartIssue
 from src.followup_models import RepairFollowup
 
+# 演示经销商与账号矩阵：主管跨商，评估员/观察员各绑一商
+DEALERS=[('DLR-NORTH','北塬经销商'),('DLR-SOUTH','南滩经销商')]
+ACCOUNTS=[
+    ('admin@gengchuan.local','admin',None),
+    ('assessor@gengchuan.local','assessor',1),
+    ('assessor.south@gengchuan.local','assessor',2),
+    ('viewer@gengchuan.local','viewer',1),
+    ('viewer.south@gengchuan.local','viewer',2),
+]
+
 def seed():
     Base.metadata.create_all(engine)
     with Session.begin() as s:
-        for role in ['admin','assessor','viewer']:
-            if not s.scalar(select(User).where(User.email==f'{role}@gengchuan.local')):s.add(User(email=f'{role}@gengchuan.local',password=password_hash('Field2026!'),role=role))
+        for code,name in DEALERS:
+            if not s.scalar(select(Dealer).where(Dealer.code==code)):s.add(Dealer(code=code,name=name))
+        s.flush()
+        for email,role,dealer_pk in ACCOUNTS:
+            if not s.scalar(select(User).where(User.email==email)):
+                s.add(User(email=email,password=password_hash('Field2026!'),role=role,dealer_id=dealer_pk))
+        # 旧机具先不归属，等待主管在页面“一次认领”
         for serial,model,hours in [('GC-2408','Paddy-90',860),('GC-2412','Dryland-120',1120),('GC-EXPIRED','Paddy-90',2450)]:
-            if not s.scalar(select(Machine).where(Machine.serial==serial)):s.add(Machine(serial=serial,model=model,purchase_date='2025-04-12',warranty_hours=2000,hours=hours))
+            if not s.scalar(select(Machine).where(Machine.serial==serial)):
+                s.add(Machine(serial=serial,model=model,purchase_date='2025-04-12',warranty_hours=2000,hours=hours,dealer_id=None))
         s.flush(); machines=s.scalars(select(Machine).order_by(Machine.id)).all()
         rng=random.Random(42)
         for i in range(180):
@@ -23,16 +40,18 @@ def seed():
             if s.scalar(select(Claim).where(Claim.code==code)):continue
             hours=rng.randint(100,2900); age=rng.randint(30,1100); leak=rng.random()<.38; part=rng.choice(['hydraulic','engine','transmission'])
             score=hours/2000+age/1300+(.7 if leak else 0)+(.3 if part=='hydraulic' else 0)+rng.uniform(-.25,.25)
-            s.add(Claim(code=code,machine_id=machines[i%2].id,part=part,hours_at_failure=hours,age_days=age,leak_flag=leak,risk=None,status='denied' if score>1.7 else 'paid',historical=True,disputed=int(score>1.7),assessment_note='历史已结案 / 模拟训练数据'))
+            # 历史索赔同样未认领，仅主管可见，认领后随机具归属
+            s.add(Claim(code=code,machine_id=machines[i%2].id,part=part,hours_at_failure=hours,age_days=age,leak_flag=leak,risk=None,status='denied' if score>1.7 else 'paid',historical=True,disputed=int(score>1.7),assessment_note='历史已结案 / 模拟训练数据',dealer_id=None))
         for code,serial,hours,age,leak in [('CL-26017','GC-2408',860,400,True),('CL-HIGH','GC-2412',1900,680,True),('CL-EXPIRED','GC-EXPIRED',2450,600,False)]:
             if not s.scalar(select(Claim).where(Claim.code==code)):
-                m=s.scalar(select(Machine).where(Machine.serial==serial));s.add(Claim(code=code,machine_id=m.id,part='hydraulic',hours_at_failure=hours,age_days=age,leak_flag=leak,status='submitted',historical=False,assessment_note=''))
+                m=s.scalar(select(Machine).where(Machine.serial==serial))
+                s.add(Claim(code=code,machine_id=m.id,part='hydraulic',hours_at_failure=hours,age_days=age,leak_flag=leak,status='submitted',historical=False,assessment_note='',dealer_id=None))
     with Session.begin() as s:
         m=s.scalar(select(Machine).where(Machine.serial=='GC-2408'))
         for code in ['CL-RETURN-DEMO','CL-SETTLE-DEMO']:
             c=s.scalar(select(Claim).where(Claim.code==code))
             if not c:
-                c=Claim(code=code,machine_id=m.id,part='hydraulic',hours_at_failure=860,age_days=400,leak_flag=True,risk=.65,status='paid',historical=False,assessment_note='模拟赔付结案，用于返厂和结算剧本');s.add(c);s.flush()
+                c=Claim(code=code,machine_id=m.id,part='hydraulic',hours_at_failure=860,age_days=400,leak_flag=True,risk=.65,status='paid',historical=False,assessment_note='模拟赔付结案，用于返厂和结算剧本',dealer_id=None);s.add(c);s.flush()
                 s.add(Inspection(claim_id=c.id,findings='密封圈异常磨损，工时及拆检资料已核验完整',evidence_complete=True,decision='paid'))
         c=s.scalar(select(Claim).where(Claim.code=='CL-SETTLE-DEMO'))
         if not s.scalar(select(PartReturn).where(PartReturn.claim_id==c.id)):
@@ -43,5 +62,5 @@ def seed():
         for code,part,qty in [('SP-HYD-01','hydraulic',20),('SP-ENG-01','engine',5),('SP-TRANS-01','transmission',3)]:
             if not s.scalar(select(SpareStock).where(SpareStock.code==code)):s.add(SpareStock(code=code,part=part,available_qty=qty))
     with Session() as s:
-        print(json.dumps({k:s.scalar(select(func.count()).select_from(v)) for k,v in [('users',User),('machines',Machine),('claims',Claim),('inspections',Inspection),('part_returns',PartReturn),('settlements',Settlement),('repair_bays',RepairBay),('repair_appointments',RepairAppointment),('spare_stocks',SpareStock),('part_issues',PartIssue),('repair_followups',RepairFollowup)]}))
+        print(json.dumps({k:s.scalar(select(func.count()).select_from(v)) for k,v in [('dealers',Dealer),('users',User),('machines',Machine),('claims',Claim),('inspections',Inspection),('part_returns',PartReturn),('settlements',Settlement),('repair_bays',RepairBay),('repair_appointments',RepairAppointment),('spare_stocks',SpareStock),('part_issues',PartIssue),('repair_followups',RepairFollowup)]}))
 if __name__=='__main__':seed()
